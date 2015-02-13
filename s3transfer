@@ -1,0 +1,276 @@
+#!/usr/bin/env python
+#
+
+"""S3 upload
+
+A simple script that will upload all files in a directory to an s3
+bucket. It does not act recursively.  Why implement yet another s3
+tool? As of this writing no tools (only libraries) support multipart
+upload which is required for files larger than 5GB.
+"""
+
+import logging
+import os
+import sys
+import random
+
+import boto
+import multiprocessing
+
+ACCESSKEY = os.environ['AWS_ACCESS_ID']
+SECRETKEY = os.environ['AWS_SECRET_KEY']
+
+log = logging.getLogger()
+log.addHandler(logging.StreamHandler())
+log.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(message)s')
+fh = logging.FileHandler('s3upload.log')
+fh.setFormatter(formatter)
+log.addHandler(fh)
+
+
+def log_upload_msg(path, bucket_name, key_name):
+    file_size_in_mb = '?'
+    try:
+        file_size_in_mb = os.stat(path).st_size / 1000000
+    except:
+        pass
+
+    log.info('Uploading %s to %s/%s (%sMB)' % (
+        path, bucket_name, key_name, file_size_in_mb))
+
+
+def run_workers(uploader, data_list):
+    upload_queue = multiprocessing.Queue()
+
+    upload_workers = []
+    worker_count = 8
+    for i in range(worker_count):
+        p = multiprocessing.Process(
+            target=uploader.upload, args=(upload_queue, ))
+        upload_workers.append(p)
+        p.start()
+
+    for data in data_list:
+        upload_queue.put(data)
+
+    #  send finish message
+    for upload_worker in upload_workers:
+        upload_queue.put((None, None, None))
+
+    for upload_worker in upload_workers:
+        upload_worker.join()
+
+
+def get_part_size(file_size):
+    return max(file_size / 9999, 5242880)
+
+
+def parts_list(file_size, part_size):
+    part_number = 1
+    offset = 0
+    while offset < file_size:
+        yield (part_number, offset, min(part_size, file_size - offset))
+        part_number += 1
+        offset += part_size
+
+
+def files_to_upload(src_dir, prefix):
+    big_files = []
+    small_files = []
+
+    for filename in [
+            x[1] for x in sorted([
+                (random.random(), x) for x in os.listdir(src_dir)])]:
+        path = os.path.join(src_dir, filename)
+        keyname = prefix + '/' + filename
+        if os.path.isdir(path):
+            log.debug('Skipping dir %s' % path)
+            continue
+
+        if os.stat(path).st_size > 40000000:
+            big_files.append((filename, path, keyname))
+        else:
+            small_files.append((filename, path, keyname))
+
+    return big_files, small_files
+
+
+def get_args(argv):
+    if argv is None:
+        argv = sys.argv
+    if len(argv) != 3:
+        print "Usage: " + argv[0] + " <source dir> <bucket/prefix>"
+        return 1
+
+    src_dir = argv[1]
+    splits = argv[2].split('/', 1)
+    bucketname = splits[0]
+    if len(splits) > 1:
+        prefix = splits[1].rstrip('/')
+    else:
+        prefix = ""
+
+    log.info(
+        'argv[1]: %s, argv[2]: %s, src_dir: %s, splits: %s, '
+        'butcketname: %s, prefix: %s' % (
+            repr(argv[1]), repr(argv[2]),
+            repr(src_dir), repr(splits),
+            repr(bucketname), repr(prefix)))
+
+    return src_dir, splits, bucketname, prefix
+
+
+class BigUploadClass:
+    def __init__(
+            self, bucket_name, filename, mp_id, mp_key_name,
+            secret_key, access_key):
+        self.filename = filename
+        self.mp_id = mp_id
+        self.mp_key_name = mp_key_name
+        self.bucket_name = bucket_name
+        self.secret_key = secret_key
+        self.access_key = access_key
+        self.part_number = None
+
+    def _upload_callback(self, transferred, total):
+        log.debug(
+            'Progress %s: %d of %d' % (self.part_number, transferred, total))
+
+    def upload(self, input_queue):
+        while True:
+            part_number, offset, length = input_queue.get()
+            self.part_number = part_number
+            if part_number is None:
+                break
+
+            retries = 0
+            while True:
+                try:
+                    conn = boto.connect_s3(self.access_key, self.secret_key)
+                    bucket = conn.get_bucket(self.bucket_name, validate=False)
+                    mp = boto.s3.multipart.MultiPartUpload(bucket)
+                    mp.key_name = self.mp_key_name
+                    mp.id = self.mp_id
+
+                    with open(self.filename, 'rb') as fp:
+                        fp.seek(offset, os.SEEK_SET)
+                        log.info('Uploading part %d, length %d' % (
+                            part_number, length))
+                        mp.upload_part_from_file(
+                            fp, part_number, size=length,
+                            cb=self._upload_callback, num_cb=100)
+
+                    break
+                except Exception as e:
+                    log.error('Upload got exception: %s' % str(e))
+                    retries += 1
+                    if retries > 10:
+                        log.error(
+                            'ERROR: Failed upload of part %d '
+                            '%d times' % (part_number, retries))
+                        raise
+
+
+def mpupload(bucket_name, keyname, filename, access_key, secret_key):
+    file_size = os.stat(filename).st_size
+
+    conn = boto.connect_s3(access_key, secret_key)
+    bucket = conn.get_bucket(bucket_name, validate=False)
+    mp = bucket.initiate_multipart_upload(keyname)
+
+    log.info(
+        'mpupload info: mp.key_name: %s, bucket_name: %s, filename: %s'
+        % (repr(mp.key_name), repr(bucket_name), repr(filename)))
+
+    uploader = BigUploadClass(
+        bucket_name, filename, mp.id, mp.key_name, secret_key, access_key)
+
+    run_workers(uploader, parts_list(file_size, get_part_size(file_size)))
+
+    mp.complete_upload()
+
+
+def upload_big_files(files, bucketname, ACCESSKEY, SECRETKEY):
+    conn = boto.connect_s3(ACCESSKEY, SECRETKEY)
+    bucket = conn.get_bucket(bucketname, validate=False)
+
+    for filename, path, keyname in files:
+        key = bucket.get_key(keyname)
+
+        # skip files already uploaded
+        if key is not None:
+            log.debug('File %s is already at s3, skipping' % (filename))
+            continue
+
+        log_upload_msg(path, bucketname, keyname)
+
+        try:
+            mpupload(bucketname, keyname, path, ACCESSKEY, SECRETKEY)
+        except boto.exception, msg:
+            log.error('Error uploading to ' + keyname + ':' + msg)
+
+
+class SmallUploadClass:
+    def __init__(
+            self, bucket_name, secret_key, access_key):
+        self.bucket_name = bucket_name
+        self.secret_key = secret_key
+        self.access_key = access_key
+
+    def upload(self, input_queue):
+        while True:
+            filename, path, keyname = input_queue.get()
+            if filename is None:
+                break
+
+            retries = 0
+            while True:
+                try:
+                    conn = boto.connect_s3(self.access_key, self.secret_key)
+                    bucket = conn.get_bucket(self.bucket_name, validate=False)
+                    key = bucket.get_key(keyname)
+
+                    # skip files already uploaded
+                    if key is not None:
+                        log.debug(
+                            'File %s is already at s3, skipping' % filename)
+                        break
+
+                    log_upload_msg(path, self.bucket_name, keyname)
+
+                    with open(path, 'rb') as fp:
+                        try:
+                            key = boto.s3.key.Key(bucket, name=keyname)
+                            key.set_contents_from_file(fp, policy='private')
+                        except boto.exception, msg:
+                            log.error(
+                                'Error uploading to ' + keyname + ':' + msg)
+
+                    break
+                except Exception as e:
+                    log.error('Upload got exception: %s' % str(e))
+                    retries += 1
+                    if retries > 10:
+                        log.error(
+                            'ERROR: Failed upload of small file %s '
+                            '%d times' % (filename, retries))
+                        raise
+
+
+def upload_small_files(files, bucketname, ACCESSKEY, SECRETKEY):
+    uploader = SmallUploadClass(
+        bucketname, SECRETKEY, ACCESSKEY)
+
+    run_workers(uploader, files)
+
+
+def main(argv=None):
+    src_dir, splits, bucketname, prefix = get_args(argv)
+    big_files, small_files = files_to_upload(src_dir, prefix)
+    upload_small_files(small_files, bucketname, ACCESSKEY, SECRETKEY)
+    upload_big_files(big_files, bucketname, ACCESSKEY, SECRETKEY)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
